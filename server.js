@@ -1,9 +1,8 @@
-/* server.js
- * Endpoints:
- *  POST /render10min/start   (multipart: bg1..bg6 OR image, optional cta, + plan JSON string)
- *  GET  /render10min/status/:jobId   -> { status: "processing"|"done"|"error", stage?, error? }
- *  GET  /render10min/result/:jobId   -> mp4 file stream
- */
+// server.js
+// Endpoints:
+//  POST /render10min/start   (multipart: bg1..bg6 OR image + plan JSON string)
+//  GET  /render10min/status/:jobId   -> { status: "processing"|"done"|"error", stage?, error? }
+//  GET  /render10min/result/:jobId   -> mp4 file stream
 
 const express = require("express");
 const multer = require("multer");
@@ -14,17 +13,8 @@ const fsp = require("fs/promises");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 
-const textToSpeech = require("@google-cloud/text-to-speech");
-// (opsiyonel fallback) OpenAI kalsın istersen
-const OpenAI = require("openai");
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ---- OpenAI fallback (istersen) ----
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
 
 // Multer: keep files in memory then write to job folder
 const upload = multer({
@@ -186,105 +176,7 @@ async function wavToM4a(inWav, outM4a) {
   ]);
 }
 
-// ---- Google TTS client ----
-let _gcpClient = null;
-
-function getGcpClient() {
-  if (_gcpClient) return _gcpClient;
-
-  // 1) standard JSON env
-  const rawJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-
-  // 2) base64 of service account JSON
-  const b64 = process.env.GCP_TTS_KEY_B64;
-
-  if (rawJson) {
-    const creds = JSON.parse(rawJson);
-    if (creds.private_key && typeof creds.private_key === "string") {
-      creds.private_key = creds.private_key.replace(/\\n/g, "\n");
-    }
-    _gcpClient = new textToSpeech.TextToSpeechClient({
-      credentials: {
-        client_email: creds.client_email,
-        private_key: creds.private_key,
-      },
-      projectId: creds.project_id,
-    });
-    return _gcpClient;
-  }
-
-  if (b64) {
-    const jsonStr = Buffer.from(b64, "base64").toString("utf8");
-    const creds = JSON.parse(jsonStr);
-    if (creds.private_key && typeof creds.private_key === "string") {
-      creds.private_key = creds.private_key.replace(/\\n/g, "\n");
-    }
-    _gcpClient = new textToSpeech.TextToSpeechClient({
-      credentials: {
-        client_email: creds.client_email,
-        private_key: creds.private_key,
-      },
-      projectId: creds.project_id,
-    });
-    return _gcpClient;
-  }
-
-  // 3) fallback: GOOGLE_APPLICATION_CREDENTIALS file path (ADC)
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    _gcpClient = new textToSpeech.TextToSpeechClient();
-    return _gcpClient;
-  }
-
-  throw new Error(
-    "Google TTS credentials missing. Set GCP_TTS_KEY_B64 (base64 service account json) or GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
-  );
-}
-
-async function ttsTrToWav(text, wavPath) {
-  const voiceName = process.env.GCP_TTS_VOICE || "tr-TR-Wavenet-D";
-  const speakingRate = Number(process.env.GCP_TTS_RATE || "1.0");
-  const pitch = Number(process.env.GCP_TTS_PITCH || "0");
-
-  try {
-    const client = getGcpClient();
-    const request = {
-      input: { text: String(text || "") },
-      voice: { languageCode: "tr-TR", name: voiceName },
-      audioConfig: {
-        audioEncoding: "LINEAR16",
-        speakingRate,
-        pitch,
-      },
-    };
-
-    const [response] = await client.synthesizeSpeech(request);
-    if (!response?.audioContent) throw new Error("Google TTS audioContent boş");
-    await writeFileSafe(wavPath, Buffer.from(response.audioContent));
-    return;
-  } catch (e) {
-    // fallback OpenAI (opsiyonel)
-    if (!openai) throw e;
-
-    const voice = process.env.OPENAI_TTS_VOICE || "marin";
-    const instructions =
-      process.env.OPENAI_TTS_INSTRUCTIONS ||
-      "Türkçe doğal ve sıcak anlatım. Net diksiyon. Cümle sonlarında kısa duraksamalar.";
-
-    const resp = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice,
-      input: String(text || ""),
-      instructions,
-      response_format: "wav",
-      speed: 0.95,
-    });
-
-    const buf = Buffer.from(await resp.arrayBuffer());
-    await writeFileSafe(wavPath, buf);
-  }
-}
-
-// ---------- VIDEO RENDER ----------
+// ---------- VIDEO RENDER (no CTA overlay, no zoom) ----------
 
 // MIME -> ext
 function pickExtByMime(mime) {
@@ -293,36 +185,6 @@ function pickExtByMime(mime) {
   if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
   if (m.includes("webp")) return ".webp";
   return ".img";
-}
-
-// Resolve CTA image:
-// 1) multipart field "cta"
-// 2) local file assets/cta.png
-// 3) env CTA_IMAGE_URL (download)
-async function resolveCta(jobDir, files) {
-  const ctaFile = (files || []).find(
-    (f) => String(f.fieldname).toLowerCase() === "cta" && f.buffer
-  );
-  if (ctaFile) {
-    const p = path.join(jobDir, "cta.png");
-    await writeFileSafe(p, ctaFile.buffer);
-    return p;
-  }
-
-  const local = path.join(process.cwd(), "assets", "cta.png");
-  try {
-    await fsp.access(local, fs.constants.R_OK);
-    return local;
-  } catch (_) {}
-
-  const url = process.env.CTA_IMAGE_URL;
-  if (url) {
-    const p = path.join(jobDir, "cta_download.png");
-    await downloadToFile(url, p);
-    return p;
-  }
-
-  return null;
 }
 
 // Accept bg1..bg6 OR image
@@ -349,10 +211,9 @@ function pickBgFiles(files) {
 /**
  * NO-ZOOM / SABİT:
  * - scale+crop ile tek kare sabit görüntü
- * - CTA altta, başta ve sonda görünür (enable between)
- * - jitter/deprem yok
+ * - CTA yok, sadece arka plan + ses
  */
-async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPath = null) {
+async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}) {
   const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
   const H = Number(process.env.VIDEO_H || plan.videoH || 720);
   const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 30);
@@ -370,11 +231,6 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
-  const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
-  const ctaEndDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
-  const ctaBottomMargin = Number(process.env.CTA_BOTTOM_MARGIN || plan.ctaBottomMargin || 24);
-
   const args = ["-y", "-loglevel", "warning"];
   args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
   args.push("-sws_flags", "bicubic+accurate_rnd");
@@ -384,9 +240,6 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   for (let i = 0; i < bgCount; i++) {
     args.push("-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
-  }
-  if (ctaEnabled) {
-    args.push("-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
   }
   args.push("-i", audioPath);
 
@@ -405,43 +258,17 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const concatIns = Array.from({ length: bgCount }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatIns}concat=n=${bgCount}:v=1:a=0[vbg]`);
 
-  let vOut = "[vbg]";
-
-  if (ctaEnabled) {
-    const ctaIndex = bgCount;
-    const ctaMaxW = Math.min(900, Math.round(W * 0.7));
-
-    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
-
-    const startFrom = 0;
-    const startTo = Math.min(total, ctaStartDur);
-    const endFrom = Math.max(0, total - ctaEndDur);
-    const endTo = total;
-
-    const enableExpr =
-      `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
-
-    parts.push(`${vOut}format=rgba[base]`);
-    parts.push(
-      `[base][cta]overlay=` +
-        `x=(main_w-overlay_w)/2:` +
-        `y=main_h-overlay_h-${ctaBottomMargin}:` +
-        `enable='${enableExpr}':format=auto,format=yuv420p[vout]`
-    );
-    vOut = "[vout]";
-  } else {
-    parts.push(`${vOut}format=yuv420p[vout]`);
-    vOut = "[vout]";
-  }
+  // Final video from backgrounds only
+  parts.push("[vbg]format=yuv420p[vout]");
 
   const filter = parts.join(";");
 
-  const audioIdx = ctaEnabled ? bgCount + 1 : bgCount;
+  const audioIdx = bgCount;
   const gop = Number(process.env.VIDEO_GOP || plan.videoGop || fps * 2);
 
   args.push(
     "-filter_complex", filter,
-    "-map", vOut,
+    "-map", "[vout]",
     "-map", `${audioIdx}:a`,
 
     "-c:v", "libx264",
@@ -479,7 +306,8 @@ function setStage(jobId, stage) {
   j.stage = stage;
 }
 
-async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
+// Sadece Arapça ses akışı: bismillahAudioUrl + her segment için arabicAudioUrl
+async function processJob(jobId, jobDir, bgPaths, plan) {
   try {
     setStage(jobId, "prepare");
 
@@ -498,14 +326,6 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
     const wavs = [];
     let idx = 0;
 
-    const addTtsClip = async (text, name) => {
-      const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
-      const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
-      await ttsTrToWav(text, raw);
-      await normalizeToWav(raw, norm);
-      wavs.push(norm);
-    };
-
     const addMp3UrlClip = async (url, name) => {
       const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
       const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
@@ -514,32 +334,22 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
       wavs.push(wav);
     };
 
-    setStage(jobId, "tts_intro");
-    if (plan.introText) await addTtsClip(plan.introText, "intro");
-
-    setStage(jobId, "tts_announce");
-    if (plan.surahAnnouncementText) await addTtsClip(plan.surahAnnouncementText, "announce");
-
+    // Bismillah Arapça dosyası (isteğe bağlı)
     setStage(jobId, "bismillah");
     if (plan.useBismillahClip && plan.bismillahAudioUrl) {
       await addMp3UrlClip(plan.bismillahAudioUrl, "bismillah_ar");
     }
 
+    // Her segment için sadece Arapça kıraat
     for (let i = 0; i < plan.segments.length; i++) {
       const s = plan.segments[i];
-      if (!s || !s.arabicAudioUrl || !s.trText) continue;
+      if (!s || !s.arabicAudioUrl) continue;
 
       setStage(jobId, `seg_${i + 1}_ar`);
       await addMp3UrlClip(s.arabicAudioUrl, `ayah${s.ayah}_ar`);
-
-      setStage(jobId, `seg_${i + 1}_tr`);
-      await addTtsClip(s.trText, `ayah${s.ayah}_tr`);
     }
 
-    setStage(jobId, "tts_outro");
-    if (plan.outroText) await addTtsClip(plan.outroText, "outro");
-
-    if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
+    if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi (Arapça)");
 
     setStage(jobId, "concat");
     const listPath = path.join(jobDir, "list.txt");
@@ -559,7 +369,7 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
 
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
-    await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan, ctaPath);
+    await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan);
 
     setStage(jobId, "verify");
     const vdur = await ffprobeDurationSec(outMp4);
@@ -619,8 +429,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       bgPaths.push(p);
     }
 
-    const ctaPath = await resolveCta(jobDir, files);
-
     jobs.set(jobId, {
       status: "processing",
       stage: "queued",
@@ -628,12 +436,11 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       createdAt: Date.now(),
     });
 
-    setImmediate(() => processJob(jobId, jobDir, bgPaths, plan, ctaPath));
+    setImmediate(() => processJob(jobId, jobDir, bgPaths, plan));
 
     res.json({
       jobId,
       bgCount: bgPaths.length,
-      cta: Boolean(ctaPath),
     });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
